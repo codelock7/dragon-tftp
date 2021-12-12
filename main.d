@@ -75,8 +75,7 @@ static byte[] serializeTo(in ubyte value, scope byte[] buf) nothrow {
 }
 
 static byte[] serializeTo(in ushort value, scope byte[] buf) nothrow {
-    value.setToBuf(buf);
-    return buf[2 .. $];
+    return buf.setIntegral(value);
 }
 
 static byte[] serializeTo(in string value, scope byte[] buf) nothrow {
@@ -109,7 +108,7 @@ class TftpException : Exception {
     }
 }
 
-class TFtpBase {
+class ClientBase {
 protected:
     Socket sock;
     Address addr;
@@ -123,6 +122,10 @@ protected:
         buf = new byte[gBlockSize + 1024];
     }
 
+    void reset() {
+        stopped = false;
+    }
+
     byte[] receivePacket() {
         const ptrdiff_t receivedBytes = sock.receiveFrom(cast(void[])buf, addr);
         if (receivedBytes == Socket.ERROR)
@@ -133,7 +136,7 @@ protected:
 
     void printError(scope byte[] remain) {
         ushort errorCode;
-        remain = errorCode.setFromBuf(remain);
+        remain = errorCode.setIntegral(remain);
         auto errorMessage = fromStringz((cast(string)remain).ptr);
         writeln("Error(", errorCode, "): ", errorMessage);
     }
@@ -147,40 +150,59 @@ protected:
     }
 };
 
-class GetCommand : TFtpBase {
+class GetRequest : ClientBase {
+    private bool mHasNext;
+    private size_t mRecvDataSize = 0;
+    private char[10] mLine;
+
     this(const string host) {
         super(host);
     }
 
     void opCall(in string fileName) {
+        reset();
         sendGetRequest(fileName);
+        try {
+            mainLoop(fileName);
+        } catch (TftpException e) {
+            writeln("Error: ", e.msg);
+        }
+    }
 
+protected:
+    override void reset() {
+        super.reset();
+        mHasNext = true;
+    }
+
+private:
+    void mainLoop(in string fileName) {
         ushort prevBlockNumber = 0;
-        while (true) {
+        while (!stopped) {
             byte[] packet = receivePacket();
             OpCode opCode;
-            packet = opCode.setFromBuf(packet);
+            packet = opCode.setIntegral(packet);
             switch (opCode) {
             case OpCode.Data:
                 ushort blockNumber;
-                byte[] block = blockNumber.setFromBuf(packet);
-                writeln("Block Number ", blockNumber);
+                byte[] data = blockNumber.setIntegral(packet);
                 if (blockNumber == prevBlockNumber) {
-                    writeln("Skip block: ", blockNumber);
                     continue;
                 }
-                prevBlockNumber = blockNumber;
                 if (blockNumber == 1) {
                     file = File(fileName, "w");
                 }
-                if (block.length == 0) {
-                    return;
-                }
-                file.write(cast(const char[])block);
-                if (block.length < gBlockSize) {
-                    return;
-                }
+                prevBlockNumber = blockNumber;
+                mRecvDataSize += packet.length;
+                writeDataToFile(data);
+
+                DataDimension dd = getRecvDataDimension();
+                writef("\r%s data received is ~%s %s (%s B)",
+                        fileName, dd.size, dd.dim, mRecvDataSize);
+
                 sendBlockAck(blockNumber);
+                if (!hasNext())
+                    stopped = true;
                 break;
 
             case OpCode.Error:
@@ -192,9 +214,43 @@ class GetCommand : TFtpBase {
             }
         }
         scope(exit) file.close();
+        scope(success) writeln();
+    }
+    
+    struct DataDimension {
+        size_t size;
+        string dim;
+    };
+
+    DataDimension getRecvDataDimension() {
+        static immutable string[] dimensions = [
+            "B", "KB", "MB", "GB", "TB",
+        ];
+
+        size_t result = mRecvDataSize;
+        size_t remainder = mRecvDataSize;
+        size_t i;
+        for (i = 0; (remainder /= 1024) > 0; ++i)
+            result = remainder;
+        DataDimension dim;
+        dim.size = result % 1024;
+        dim.dim = dimensions[i];
+        return dim;
     }
 
-private:
+    bool hasNext() const {
+        return mHasNext;
+    }
+
+    void writeDataToFile(in byte[] data) {
+        if (data.length > 0) {
+            file.rawWrite(data);
+            if (data.length == gBlockSize)
+                return;
+        }
+        mHasNext = false;
+    }
+
     void sendBlockAck(in ushort blockNumber) {
         const byte[] packet = makeAckPacket(blockNumber);
         sendPacket(packet);
@@ -222,7 +278,7 @@ private:
 };
 
 
-class PutCommand : TFtpBase {
+class PutRequest : ClientBase {
     private bool mHasNext;
 
     this(in string host) {
@@ -246,6 +302,12 @@ class PutCommand : TFtpBase {
         } catch (TftpException e) {
             writeln("Error: ", e.msg);
         }
+    }
+
+protected:
+    override void reset() {
+        super.reset();
+        mHasNext = true;
     }
 
 private:
@@ -281,12 +343,12 @@ private:
         while (!stopped) {
             byte[] answer = receivePacket();
             OpCode opCode;
-            byte[] remain = opCode.setFromBuf(answer);
+            byte[] remain = opCode.setIntegral(answer);
 
             switch (opCode) {
             case OpCode.Acknowledgment:
                 ushort blockNumber;
-                blockNumber.setFromBuf(remain);
+                blockNumber.setIntegral(remain);
                 if (blockNumber != currentBlockNumber)
                     continue;
 
@@ -314,11 +376,7 @@ private:
         }
     }
 
-    private void reset() nothrow {
-        mHasNext = true;
-    }
-
-    private bool hasNext() const nothrow {
+    bool hasNext() const nothrow {
         return mHasNext;
     }
 
@@ -359,7 +417,7 @@ union ByteRepr(T) {
     void[T.sizeof] bytes;
 };
 
-static byte[] setToBuf(T)(in T value, scope byte[] buf) nothrow {
+static byte[] setIntegral(T)(scope byte[] buf, in T value) nothrow {
     static assert(isIntegral!T);
     ByteRepr!T br;
     static if (T.sizeof == ushort.sizeof)
@@ -370,7 +428,7 @@ static byte[] setToBuf(T)(in T value, scope byte[] buf) nothrow {
     return buf[T.sizeof .. $];
 }
 
-static byte[] setFromBuf(T)(ref T value, byte[] buf) nothrow {
+static byte[] setIntegral(T)(ref T value, byte[] buf) nothrow {
     static assert(isIntegral!T);
     ByteRepr!T br;
     br.bytes = buf[0 .. T.sizeof];
@@ -392,14 +450,14 @@ int main(immutable string[] args) {
         writefln("\"host\" \"put|get\" \"file name\"");
         return ExitCode.InvalidArgumentsNumber;
     }
-    const string host = args[1];
-    const string command = args[2];
+    const string host     = args[1];
+    const string command  = args[2];
     const string fileName = args[3];
     if (command == "get") {
-        GetCommand get = new GetCommand(host);
+        auto get = new GetRequest(host);
         get(fileName);
     } else if (command == "put") {
-        PutCommand put = new PutCommand(host);
+        auto put = new PutRequest(host);
         put(fileName);
     } else {
         writeln("Unknown command: ", command);
