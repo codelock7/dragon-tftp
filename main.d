@@ -100,6 +100,12 @@ static byte[] serialize(T)(ref T value, scope byte[] buf) {
     return buf[0 .. buf.length - it.length];
 }
 
+class TftpException : Exception {
+    this(string msg, string file = __FILE__, size_t line = __LINE__) {
+        super(msg, file, line);
+    }
+}
+
 class TFtpBase {
 protected:
     Socket sock;
@@ -134,6 +140,14 @@ protected:
         auto errorMessage = fromStringz((cast(string)remain).ptr);
         writeln("Error(", errorCode, "): ", errorMessage);
     }
+
+    void sendPacket(in byte[] packet) {
+        const ptrdiff_t bytesSent = sock.sendTo(cast(const void[])packet, addr);
+        if (bytesSent == Socket.ERROR)
+            throw new TftpException("Socket error while sending data");
+        if (bytesSent != packet.length)
+            throw new TftpException("Packet sent incomplete");
+    }
 };
 
 class GetCommand : TFtpBase {
@@ -142,10 +156,7 @@ class GetCommand : TFtpBase {
     }
 
     void opCall(in string fileName) {
-        if (!sendGetRequest(fileName)) {
-            writeln("Failed to get file");
-            return;
-        }
+        sendGetRequest(fileName);
 
         ushort prevBlockNumber = 0;
         while (true) {
@@ -172,7 +183,7 @@ class GetCommand : TFtpBase {
                 if (block.length < blockSize) {
                     return;
                 }
-                sendBlockConfirmation(blockNumber);
+                sendBlockAck(blockNumber);
                 break;
 
             case OpCode.Error:
@@ -187,19 +198,14 @@ class GetCommand : TFtpBase {
     }
 
 private:
-    void sendBlockConfirmation(in ushort blockNumber) {
+    void sendBlockAck(in ushort blockNumber) {
         const byte[] packet = makeAckPacket(blockNumber);
-        sock.sendTo(cast(const void[])packet, addr);
+        sendPacket(packet);
     }
 
-    bool sendGetRequest(in string fileName) {
+    void sendGetRequest(in string fileName) {
         const byte[] packet = makeGetPacket(fileName);
-        const ptrdiff_t bytesSent = sock.sendTo(cast(const void[])packet, addr);
-        if (bytesSent == Socket.ERROR) {
-            writeln("GET ERROR");
-            return false;
-        }
-        return true;
+        sendPacket(packet);
     }
 
     byte[] makeAckPacket(in ushort blockNumber) {
@@ -220,6 +226,8 @@ private:
 
 
 class PutCommand : TFtpBase {
+    private bool mHasNext;
+
     this(in string host) {
         super(host);
     }
@@ -228,10 +236,17 @@ class PutCommand : TFtpBase {
         file = File(fileName, "r");
         scope(exit) file.close();
 
-        if (!sendPutRequest(fileName)) {
-            writeln("Failed to get file");
-            return;
+        reset();
+        sendPutRequest(fileName);
+        try {
+            mainLoop();
+        } catch (TftpException e) {
+            writeln("Error: ", e.msg);
         }
+    }
+
+private:
+    void mainLoop() {
         ushort currentBlockNumber = 0;
         while (!stopped) {
             byte[] answer = receivePacket();
@@ -242,13 +257,12 @@ class PutCommand : TFtpBase {
             case OpCode.Acknowledgment:
                 ushort blockNumber;
                 blockNumber.setFromBuf(remain);
-                if (blockNumber != currentBlockNumber) {
+                if (blockNumber != currentBlockNumber)
                     continue;
-                }
                 ++currentBlockNumber;
-                if (!sendNextBlock(currentBlockNumber)) {
-                    return;
-                }
+                sendNextBlock(currentBlockNumber);
+                if (!hasNext())
+                    stopped = true;
                 break;
 
             case OpCode.Error:
@@ -261,36 +275,34 @@ class PutCommand : TFtpBase {
         }
     }
 
-private:
+    private void reset() nothrow {
+        mHasNext = true;
+    }
+
+    private bool hasNext() const nothrow {
+        return mHasNext;
+    }
+
+    void sendNextBlock(in ushort blockNumber) {
+        const byte[] packet = makeDataPacket(blockNumber);
+        sendPacket(packet);
+        const size_t expectedSize = ODataPacket.opCode.sizeof
+                + ODataPacket.blockNumber.sizeof
+                + blockSize;
+        mHasNext = packet.length == expectedSize;
+    }
+
+    void sendPutRequest(in string fileName) {
+        const byte[] packet = makePutPacket(fileName);
+        sendPacket(packet);
+    }
+
     byte[] makeDataPacket(in ushort blockNumber) {
         ODataPacket packet;
         packet.opCode = OpCode.Data;
         packet.blockNumber = blockNumber;
         packet.blocksSource = &file;
         return packet.serialize(buf);
-    }
-
-    bool sendNextBlock(in ushort blockNumber) {
-        const byte[] packet = makeDataPacket(blockNumber);
-        const size_t bytesSent = sock.sendTo(cast(const void[])packet, addr);
-        if (bytesSent != packet.length) {
-            return false;
-        }
-        if (bytesSent < blockSize + 4) {
-            return false;
-        }
-        return true;
-    }
-
-    bool sendPutRequest(in string fileName) {
-        const byte[] packet = makePutPacket(fileName);
-        const ptrdiff_t bytesSent = sock.sendTo(cast(const void[])packet, addr);
-        writeln("Sent ", bytesSent);
-        if (bytesSent == Socket.ERROR) {
-            writeln("GET ERROR");
-            return false;
-        }
-        return true;
     }
 
     byte[] makePutPacket(in string fileName) {
