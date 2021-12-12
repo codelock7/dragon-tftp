@@ -134,10 +134,10 @@ protected:
         return packet;
     }
 
-    void printError(scope byte[] remain) {
+    void printError(scope byte[] packet) {
         ushort errorCode;
-        remain = errorCode.setIntegral(remain);
-        auto errorMessage = fromStringz((cast(string)remain).ptr);
+        packet = errorCode.setIntegral(packet);
+        auto errorMessage = fromStringz((cast(string)packet).ptr);
         writeln("Error(", errorCode, "): ", errorMessage);
     }
 
@@ -151,9 +151,7 @@ protected:
 };
 
 class GetRequest : ClientBase {
-    private bool mHasNext;
-    private size_t mRecvDataSize = 0;
-    private char[10] mLine;
+    private bool mHasData;
 
     this(const string host) {
         super(host);
@@ -172,12 +170,18 @@ class GetRequest : ClientBase {
 protected:
     override void reset() {
         super.reset();
-        mHasNext = true;
+        mHasData = true;
     }
 
 private:
+    struct DataDimension {
+        size_t len;
+        string dim;
+    };
+
     void mainLoop(in string fileName) {
         ushort prevBlockNumber = 0;
+        size_t recvDataLen = 0;
         while (!stopped) {
             byte[] packet = receivePacket();
             OpCode opCode;
@@ -186,23 +190,19 @@ private:
             case OpCode.Data:
                 ushort blockNumber;
                 byte[] data = blockNumber.setIntegral(packet);
-                if (blockNumber == prevBlockNumber) {
+                if (blockNumber == prevBlockNumber)
                     continue;
-                }
-                if (blockNumber == 1) {
+                if (blockNumber == 1)
                     file = File(fileName, "w");
-                }
                 prevBlockNumber = blockNumber;
-                mRecvDataSize += packet.length;
+                recvDataLen += data.length;
                 writeDataToFile(data);
-
-                DataDimension dd = getRecvDataDimension();
-                writef("\r%s data received is ~%s %s (%s B)",
-                        fileName, dd.size, dd.dim, mRecvDataSize);
-
-                sendBlockAck(blockNumber);
-                if (!hasNext())
+                if (!hasData())
                     stopped = true;
+                DataDimension dd = getRecvDataDimension(recvDataLen);
+                writef("\r%s data received is ~%s %s (%s B)",
+                        fileName, dd.len, dd.dim, recvDataLen);
+                sendBlockAck(blockNumber);
                 break;
 
             case OpCode.Error:
@@ -217,29 +217,23 @@ private:
         scope(success) writeln();
     }
     
-    struct DataDimension {
-        size_t size;
-        string dim;
-    };
-
-    DataDimension getRecvDataDimension() {
+    DataDimension getRecvDataDimension(in size_t recvDataLen) {
         static immutable string[] dimensions = [
             "B", "KB", "MB", "GB", "TB",
         ];
-
-        size_t result = mRecvDataSize;
-        size_t remainder = mRecvDataSize;
-        size_t i;
-        for (i = 0; (remainder /= 1024) > 0; ++i)
-            result = remainder;
-        DataDimension dim;
-        dim.size = result % 1024;
-        dim.dim = dimensions[i];
-        return dim;
+        DataDimension r;
+        r.len = recvDataLen;
+        r.dim = dimensions[0];
+        size_t remainder = recvDataLen;
+        for (size_t i = 1; (remainder /= 1024) != 0; ++i) {
+            r.len = remainder;
+            r.dim = dimensions[i];
+        }
+        return r;
     }
 
-    bool hasNext() const {
-        return mHasNext;
+    bool hasData() const {
+        return mHasData;
     }
 
     void writeDataToFile(in byte[] data) {
@@ -248,7 +242,7 @@ private:
             if (data.length == gBlockSize)
                 return;
         }
-        mHasNext = false;
+        mHasData = false;
     }
 
     void sendBlockAck(in ushort blockNumber) {
