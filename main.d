@@ -1,16 +1,19 @@
 import std.string;
 import std.string: fromStringz;
 import std.socket;
-import std.stdio: File, writefln, writeln, write, chunks;
+import std.stdio: File, writefln, writeln, writef, write, chunks;
 import std.file: exists;
 import std.digest: toHexString, Order;
 import std.traits: isIntegral;
+import core.stdc.stdio;
 
 
 extern(C)
 {
     ushort htons(ushort) nothrow;
 }
+
+immutable size_t gBlockSize = 512;
 
 enum OpCode : ushort {
     ReadRequest = 1,
@@ -124,13 +127,9 @@ protected:
 
     byte[] receivePacket() {
         const ptrdiff_t receivedBytes = sock.receiveFrom(cast(void[])buf, addr);
-        writeln("Receive bytes: ", receivedBytes);
-        if (receivedBytes == Socket.ERROR) {
-            writeln("RECV ERROR");
+        if (receivedBytes == Socket.ERROR)
             return null;
-        }
         byte[] packet = buf[0 .. receivedBytes];
-        writeln(toHexString(cast(const ubyte[])packet));
         return packet;
     }
 
@@ -240,18 +239,47 @@ class PutCommand : TFtpBase {
         file = File(fileName, "r");
         scope(exit) file.close();
 
+        auto progress = Progress(file.size());
+
         reset();
         sendPutRequest(fileName);
         try {
-            mainLoop();
+            mainLoop(progress);
         } catch (TftpException e) {
             writeln("Error: ", e.msg);
         }
     }
 
 private:
-    void mainLoop() {
+    struct Progress {
+        immutable size_t lineLen = 20;
+        private float mFactor;
+
+        this(in size_t size) {
+            mFactor = calcBlockFactor(size);
+        }
+
+        void setTo(scope char[] line, in size_t blockNumber) const {
+            const size_t end = cast(size_t)(blockNumber * mFactor);
+            if (end == 0)
+                return;
+            line[0 .. end - 1] = '=';
+            line[end - 1] = '>';
+        }
+
+    private:
+        float calcBlockFactor(size_t size) {
+            const size_t remainder = (size % gBlockSize) != 0;
+            const size_t fileBlocks = size / gBlockSize + remainder;
+            return float(lineLen) / float(fileBlocks);
+        }
+    }
+
+    void mainLoop(in Progress progress) {
+        string progressLineTemplate = "\r[%s]";
+        char[Progress.lineLen] progressLine = '-';
         ushort currentBlockNumber = 0;
+
         while (!stopped) {
             byte[] answer = receivePacket();
             OpCode opCode;
@@ -263,6 +291,11 @@ private:
                 blockNumber.setFromBuf(remain);
                 if (blockNumber != currentBlockNumber)
                     continue;
+
+                progress.setTo(progressLine, currentBlockNumber);
+                writef(progressLineTemplate, progressLine);
+                fflush(stdout);
+
                 ++currentBlockNumber;
                 sendNextBlock(currentBlockNumber);
                 if (!hasNext())
@@ -276,6 +309,10 @@ private:
             default:
                 assert(false);
             }
+        }
+        scope(success) {
+            progressLine = '=';
+            writefln(progressLineTemplate, progressLine);
         }
     }
 
