@@ -2,6 +2,7 @@ import std.string;
 import std.string: fromStringz;
 import std.socket;
 import std.stdio: File, writefln, writeln, write, chunks;
+import std.file: exists;
 import std.digest: toHexString, Order;
 import std.traits: isIntegral;
 
@@ -232,6 +233,10 @@ class PutCommand : TFtpBase {
     }
 
     void opCall(in string fileName) {
+        if (!exists(fileName)) {
+            writeln("File doesn't exist: ", fileName);
+            return;
+        }
         file = File(fileName, "r");
         scope(exit) file.close();
 
