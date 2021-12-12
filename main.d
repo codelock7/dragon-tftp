@@ -8,7 +8,7 @@ import std.traits: isIntegral;
 
 extern(C)
 {
-    ushort htons(ushort);
+    ushort htons(ushort) nothrow;
 }
 
 enum OpCode : ushort {
@@ -25,7 +25,7 @@ enum Mode {
     Mail,
 };
 
-string toString(Mode mode) {
+static string toString(Mode mode) nothrow {
     final switch (mode) {
     case Mode.NetAscii:
         return "netascii";
@@ -65,26 +65,25 @@ struct ErrorPacket {
     string errorMessage;
 };
 
-static byte[] serializeTo(in ubyte value, scope byte[] buf) {
+static byte[] serializeTo(in ubyte value, scope byte[] buf) nothrow {
     buf[0] = cast(byte) value;
     return buf[1 .. $];
 }
 
-static byte[] serializeTo(in ushort value, scope byte[] buf) {
+static byte[] serializeTo(in ushort value, scope byte[] buf) nothrow {
     value.setToBuf(buf);
     return buf[2 .. $];
 }
 
-static byte[] serializeTo(in string value, scope byte[] buf) {
+static byte[] serializeTo(in string value, scope byte[] buf) nothrow {
     if (!value.length)
         return buf;
-    writeln("char[] size ", value.length);
     buf[0 .. value.length] = cast(byte[])value;
     buf[value.length] = 0;
     return buf[value.length + 1 .. $];
 }
 
-static byte[] serializeTo(in Mode mode, scope byte[] buf) {
+static byte[] serializeTo(in Mode mode, scope byte[] buf) nothrow {
     return toString(mode).serializeTo(buf);
 }
 
@@ -208,7 +207,7 @@ private:
         sendPacket(packet);
     }
 
-    byte[] makeAckPacket(in ushort blockNumber) {
+    byte[] makeAckPacket(in ushort blockNumber) nothrow {
         AckPacket packet;
         packet.opCode = OpCode.Acknowledgment;
         packet.blockNumber = blockNumber;
@@ -320,7 +319,7 @@ union ByteRepr(T) {
     void[T.sizeof] bytes;
 };
 
-static byte[] setToBuf(T)(in T value, scope byte[] buf) {
+static byte[] setToBuf(T)(in T value, scope byte[] buf) nothrow {
     static assert(isIntegral!T);
     ByteRepr!T br;
     static if (T.sizeof == ushort.sizeof)
@@ -331,7 +330,7 @@ static byte[] setToBuf(T)(in T value, scope byte[] buf) {
     return buf[T.sizeof .. $];
 }
 
-static byte[] setFromBuf(T)(ref T value, byte[] buf) {
+static byte[] setFromBuf(T)(ref T value, byte[] buf) nothrow {
     static assert(isIntegral!T);
     ByteRepr!T br;
     br.bytes = buf[0 .. T.sizeof];
