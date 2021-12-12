@@ -115,14 +115,12 @@ protected:
     Address addr;
     byte[] buf;
     File file;
-    size_t blockSize;
     bool stopped = false;
 
     this(in string host) {
         sock = new UdpSocket();
         addr = new InternetAddress(host, 69);
-        blockSize = 512;
-        buf = new byte[blockSize + 1024];
+        buf = new byte[gBlockSize + 1024];
     }
 
     byte[] receivePacket() {
@@ -179,7 +177,7 @@ class GetCommand : TFtpBase {
                     return;
                 }
                 file.write(cast(const char[])block);
-                if (block.length < blockSize) {
+                if (block.length < gBlockSize) {
                     return;
                 }
                 sendBlockAck(blockNumber);
@@ -329,7 +327,7 @@ private:
         sendPacket(packet);
         const size_t expectedSize = ODataPacket.opCode.sizeof
                 + ODataPacket.blockNumber.sizeof
-                + blockSize;
+                + gBlockSize;
         mHasNext = packet.length == expectedSize;
     }
 
