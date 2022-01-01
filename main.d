@@ -13,6 +13,12 @@ extern(C)
     ushort htons(ushort) nothrow;
 }
 
+ushort toNetworkByteOrder(ushort value) nothrow {
+    return htons(value);
+}
+
+alias BlockReader = size_t delegate(scope byte[]);
+
 immutable size_t gBlockSize = 512;
 
 enum OpCode : ushort {
@@ -29,6 +35,7 @@ enum Mode {
     Mail,
 };
 
+@safe
 static string toString(Mode mode) nothrow {
     final switch (mode) {
     case Mode.NetAscii:
@@ -60,7 +67,7 @@ struct DataPacket {
 struct ODataPacket {
     OpCode opCode;
     ushort blockNumber;
-    File* blocksSource;
+    BlockReader blocksSource;
 }
 
 struct ErrorPacket {
@@ -69,40 +76,46 @@ struct ErrorPacket {
     string errorMessage;
 };
 
-static byte[] serializeTo(in ubyte value, scope byte[] buf) nothrow {
-    buf[0] = cast(byte) value;
-    return buf[1 .. $];
+static byte[] serializeTo(in ubyte value, return scope byte[] buf) nothrow {
+    auto buffer = Buffer(buf);
+    buffer.push(value);
+    return buffer.getRemainder();
+    // buf[0] = cast(byte) value;
+    // return buf[1 .. $];
 }
 
-static byte[] serializeTo(in ushort value, scope byte[] buf) nothrow {
-    return buf.setIntegral(value);
+static byte[] serializeTo(in ushort value, return scope byte[] buf) nothrow {
+    auto buffer = Buffer(buf);
+    buffer.push(value);
+    return buffer.getRemainder();
 }
 
-static byte[] serializeTo(in string value, scope byte[] buf) nothrow {
+static byte[] serializeTo(in string value, return scope byte[] buf) {
     if (!value.length)
         return buf;
+    writeln("BUFSZ ", buf.length);
     buf[0 .. value.length] = cast(byte[])value;
     buf[value.length] = 0;
     return buf[value.length + 1 .. $];
 }
 
-static byte[] serializeTo(in Mode mode, scope byte[] buf) nothrow {
+static byte[] serializeTo(in Mode mode, return scope byte[] buf) {
     return toString(mode).serializeTo(buf);
 }
 
-static byte[] serializeTo(scope File* file, scope byte[] buf) {
-    byte[] r = (*file).rawRead(buf[0 .. 512]);
-    return buf[r.length .. $];
+static byte[] serializeTo(BlockReader reader, return scope byte[] buf) {
+    const size_t len = reader(buf[0 .. gBlockSize]);
+    return buf[len .. $];
 }
 
-static byte[] serialize(T)(ref T value, scope byte[] buf) {
+static byte[] serialize(T)(ref T value, return scope byte[] buf) {
     byte[] it = buf;
     foreach (item; value.tupleof)
         it = item.serializeTo(it);
     return buf[0 .. buf.length - it.length];
 }
 
-class TftpException : Exception {
+class TFTPException : Exception {
     this(string msg, string file = __FILE__, size_t line = __LINE__) {
         super(msg, file, line);
     }
@@ -114,6 +127,7 @@ protected:
     Address addr;
     byte[] buf;
     File file;
+    Buffer mBuffer;
     bool stopped = false;
 
     this(in string host) {
@@ -127,7 +141,7 @@ protected:
     }
 
     byte[] receivePacket() {
-        const ptrdiff_t receivedBytes = sock.receiveFrom(cast(void[])buf, addr);
+        const ptrdiff_t receivedBytes = receive(buf);
         if (receivedBytes == Socket.ERROR)
             return null;
         byte[] packet = buf[0 .. receivedBytes];
@@ -136,17 +150,29 @@ protected:
 
     void printError(scope byte[] packet) {
         ushort errorCode;
-        packet = errorCode.setIntegral(packet);
+        auto buffer = Buffer(packet);
+        buffer.pop(errorCode);
+        packet = buffer.getRemainder();
+        //packet = errorCode.setIntegral(packet);
         auto errorMessage = fromStringz((cast(string)packet).ptr);
         writeln("Error(", errorCode, "): ", errorMessage);
     }
 
     void sendPacket(in byte[] packet) {
-        const ptrdiff_t bytesSent = sock.sendTo(cast(const void[])packet, addr);
+        const ptrdiff_t bytesSent = send(packet);
         if (bytesSent == Socket.ERROR)
-            throw new TftpException("Socket error while sending data");
+            throw new TFTPException("Socket error while sending data");
         if (bytesSent != packet.length)
-            throw new TftpException("Packet sent incomplete");
+            throw new TFTPException("Packet sent incomplete");
+    }
+
+private:
+    ptrdiff_t receive(scope void[] buf) {
+        return sock.receiveFrom(cast(void[]) buf, addr);
+    }
+
+    ptrdiff_t send(in byte[] buf) {
+        return sock.sendTo(cast(const void[]) buf, addr);
     }
 };
 
@@ -162,7 +188,7 @@ class GetRequest : ClientBase {
         sendGetRequest(fileName);
         try {
             mainLoop(fileName);
-        } catch (TftpException e) {
+        } catch (TFTPException e) {
             writeln("Error: ", e.msg);
         }
     }
@@ -185,16 +211,21 @@ private:
         while (!stopped) {
             byte[] packet = receivePacket();
             OpCode opCode;
-            packet = opCode.setIntegral(packet);
+            auto buffer = Buffer(packet);
+            buffer.pop(opCode);
+            //packet = opCode.setIntegral(packet);
             switch (opCode) {
             case OpCode.Data:
                 ushort blockNumber;
-                byte[] data = blockNumber.setIntegral(packet);
+                buffer.pop(blockNumber);
+                byte[] data = buffer.getRemainder();
+                //byte[] data = blockNumber.setIntegral(packet);
                 if (blockNumber == prevBlockNumber)
                     continue;
                 if (blockNumber == 1)
                     file = File(fileName, "w");
                 prevBlockNumber = blockNumber;
+                // recvDataLen += buffer.getRemainder().length;
                 recvDataLen += data.length;
                 writeDataToFile(data);
                 if (!hasData())
@@ -293,7 +324,7 @@ class PutRequest : ClientBase {
         sendPutRequest(fileName);
         try {
             mainLoop(progress);
-        } catch (TftpException e) {
+        } catch (TFTPException e) {
             writeln("Error: ", e.msg);
         }
     }
@@ -337,12 +368,16 @@ private:
         while (!stopped) {
             byte[] answer = receivePacket();
             OpCode opCode;
-            byte[] remain = opCode.setIntegral(answer);
+            auto buffer = Buffer(answer);
+            buffer.pop(opCode);
+            byte[] remain = buffer.getRemainder();
+            //byte[] remain = opCode.setIntegral(answer);
 
             switch (opCode) {
             case OpCode.Acknowledgment:
                 ushort blockNumber;
-                blockNumber.setIntegral(remain);
+                buffer.pop(blockNumber);
+                //blockNumber.setIntegral(remain);
                 if (blockNumber != currentBlockNumber)
                     continue;
 
@@ -392,7 +427,7 @@ private:
         ODataPacket packet;
         packet.opCode = OpCode.Data;
         packet.blockNumber = blockNumber;
-        packet.blocksSource = &file;
+        packet.blocksSource = makeFileReaderFunc();
         return packet.serialize(buf);
     }
 
@@ -403,6 +438,13 @@ private:
         packet.fileName = fileName;
         return packet.serialize(buf);
     }
+
+    BlockReader makeFileReaderFunc() nothrow {
+        return delegate size_t(scope byte[] buf) {
+            const byte[] res = file.rawRead(buf);
+            return res.length;
+        };
+    }
 };
 
 
@@ -411,27 +453,74 @@ union ByteRepr(T) {
     void[T.sizeof] bytes;
 };
 
-static byte[] setIntegral(T)(scope byte[] buf, in T value) nothrow {
-    static assert(isIntegral!T);
-    ByteRepr!T br;
-    static if (T.sizeof == ushort.sizeof)
-        br.value = htons(value);
-    else
-        static assert(false);
-    buf[0 .. br.bytes.length] = cast(byte[])br.bytes;
-    return buf[T.sizeof .. $];
+struct Buffer
+{
+    // this(size_t bufferSize) {
+    //     mBuffer = new byte[bufferSize];
+    // }
+
+    this(byte[] outerBuffer) nothrow {
+        mBuffer = outerBuffer;
+        mFree = mBuffer;
+    }
+
+    byte[] getRemainder() nothrow {
+        return mFree;
+    }
+
+    void push(T)(in T integer) nothrow {
+        ByteRepr!T temp;
+        temp.value = toNetworkByteOrder(integer);
+        auto buf = getFreeAndCut(T.sizeof);
+        buf[0 .. temp.bytes.length] = cast(byte[])temp.bytes;
+    }
+
+    void push(in ubyte value) nothrow {
+        auto buf = getFreeAndCut(ubyte.sizeof);
+        buf[0] = cast(byte)value;
+    }
+
+    void pop(T)(ref T integer) nothrow {
+        ByteRepr!T temp;
+        temp.bytes = getFreeAndCut(T.sizeof);
+        integer = cast(T)toNetworkByteOrder(temp.value);
+    }
+
+    size_t popBlock(size_t delegate(byte[]) writeFunc) {
+        auto buf = getFreeAndCut(gBlockSize);
+        return writeFunc(buf);
+    }
+
+    void opAssign(byte[] rhs) {
+        mFree = rhs;
+    }
+
+protected:
+    byte[] getFreeAndCut(size_t length) nothrow {
+        auto result = mFree[0 .. length];
+        mFree = mFree[length .. $];
+        return result;
+    }
+
+private:
+    byte[] mBuffer;
+    byte[] mFree;
 }
 
-static byte[] setIntegral(T)(ref T value, byte[] buf) nothrow {
-    static assert(isIntegral!T);
-    ByteRepr!T br;
-    br.bytes = buf[0 .. T.sizeof];
-    static if (T.sizeof == ushort.sizeof)
-        value = cast(T)htons(br.value);
-    else
-        static assert(false);
-    return buf[T.sizeof .. $];
-}
+// static byte[] setIntegral(T)(return scope byte[] buf, in T value) nothrow {
+//     ByteRepr!T temp;
+
+//     temp.value = toNetworkByteOrder(value);
+//     buf = cast(byte[]) temp.bytes;
+//     return buf[T.sizeof .. $];
+// }
+
+// static byte[] setIntegral(T)(ref T value, return byte[] buf) nothrow {
+//     ByteRepr!T temp;
+//     temp.bytes = buf;
+//     value = cast(T) toNetworkByteOrder(temp.value);
+//     return buf[T.sizeof .. $];
+// }
 
 enum ExitCode {
     Success,
@@ -439,7 +528,7 @@ enum ExitCode {
     UnknownCommand,
 };
 
-int main(immutable string[] args) {
+int main(string[] args) {
     if (args.length < 4) {
         writefln("\"host\" \"put|get\" \"file name\"");
         return ExitCode.InvalidArgumentsNumber;
