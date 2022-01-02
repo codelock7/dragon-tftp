@@ -13,11 +13,33 @@ extern(C)
     ushort htons(ushort) nothrow;
 }
 
-ushort toNetworkByteOrder(ushort value) nothrow {
+static ushort toNetworkByteOrder(ushort value) nothrow {
     return htons(value);
 }
 
-alias BlockReader = size_t delegate(scope byte[]);
+struct DataDimension {
+    size_t len;
+    string dim;
+};
+
+@safe
+static DataDimension sizeToDataDimension(size_t dataSize) {
+    static immutable string[] dimensions = [
+        "B", "KB", "MB", "GB", "TB",
+    ];
+    DataDimension r;
+    r.len = dataSize;
+    r.dim = dimensions[0];
+    size_t remainder = dataSize;
+    for (size_t i = 1; (remainder /= 1024) != 0; ++i) {
+        r.len = remainder;
+        r.dim = dimensions[i];
+    }
+    return r;
+}
+
+
+alias ReadFunc = size_t delegate(scope byte[]);
 
 immutable size_t gBlockSize = 512;
 
@@ -49,7 +71,7 @@ static string toString(Mode mode) nothrow {
 
 struct GetPutPacket {
     OpCode opCode;
-    string fileName;
+    string filename;
     Mode mode;
 };
 
@@ -67,7 +89,7 @@ struct DataPacket {
 struct ODataPacket {
     OpCode opCode;
     ushort blockNumber;
-    BlockReader blocksSource;
+    ReadFunc blocksSource;
 }
 
 struct ErrorPacket {
@@ -76,44 +98,35 @@ struct ErrorPacket {
     string errorMessage;
 };
 
-static byte[] serializeTo(in ubyte value, return scope byte[] buf) nothrow {
-    auto buffer = Buffer(buf);
-    buffer.push(value);
-    return buffer.getRemainder();
-    // buf[0] = cast(byte) value;
-    // return buf[1 .. $];
+struct Serializer {
+    this(scope byte[] data) {
+        mBuffer = Buffer(data);
+    }
+
+    byte[] opCall(T)(scope ref T value) {
+        foreach (item; value.tupleof)
+            serialize(item);
+        return mBuffer.getUsed();
+    }
+
+private:
+    void serialize(in Mode mode) {
+        mBuffer.push(toString(mode));
+    }
+
+    void serialize(in ReadFunc readFunc) {
+        assert(readFunc);
+        mBuffer.pushBlock(readFunc);
+    }
+
+    void serialize(T)(in T value) {
+        mBuffer.push(value);
+    }
+
+private:
+    Buffer mBuffer;
 }
 
-static byte[] serializeTo(in ushort value, return scope byte[] buf) nothrow {
-    auto buffer = Buffer(buf);
-    buffer.push(value);
-    return buffer.getRemainder();
-}
-
-static byte[] serializeTo(in string value, return scope byte[] buf) {
-    if (!value.length)
-        return buf;
-    writeln("BUFSZ ", buf.length);
-    buf[0 .. value.length] = cast(byte[])value;
-    buf[value.length] = 0;
-    return buf[value.length + 1 .. $];
-}
-
-static byte[] serializeTo(in Mode mode, return scope byte[] buf) {
-    return toString(mode).serializeTo(buf);
-}
-
-static byte[] serializeTo(BlockReader reader, return scope byte[] buf) {
-    const size_t len = reader(buf[0 .. gBlockSize]);
-    return buf[len .. $];
-}
-
-static byte[] serialize(T)(ref T value, return scope byte[] buf) {
-    byte[] it = buf;
-    foreach (item; value.tupleof)
-        it = item.serializeTo(it);
-    return buf[0 .. buf.length - it.length];
-}
 
 class TFTPException : Exception {
     this(string msg, string file = __FILE__, size_t line = __LINE__) {
@@ -123,121 +136,122 @@ class TFTPException : Exception {
 
 class ClientBase {
 protected:
-    Socket sock;
-    Address addr;
+    Socket mSocket;
+    Address mAddress;
     byte[] buf;
     File file;
     Buffer mBuffer;
-    bool stopped = false;
+    bool mStopped = false;
 
     this(in string host) {
-        sock = new UdpSocket();
-        addr = new InternetAddress(host, 69);
+        mSocket = new UdpSocket();
+        mAddress = new InternetAddress(host, 69);
         buf = new byte[gBlockSize + 1024];
     }
 
     void reset() {
-        stopped = false;
+        mStopped = false;
     }
 
-    byte[] receivePacket() {
-        const ptrdiff_t receivedBytes = receive(buf);
-        if (receivedBytes == Socket.ERROR)
+    byte[] receiveData() {
+        const ptrdiff_t len = receive(buf);
+        if (len == Socket.ERROR)
             return null;
-        byte[] packet = buf[0 .. receivedBytes];
-        return packet;
+        byte[] data = buf[0 .. len];
+        return data;
     }
 
-    void printError(scope byte[] packet) {
-        ushort errorCode;
-        auto buffer = Buffer(packet);
-        buffer.pop(errorCode);
-        packet = buffer.getRemainder();
-        //packet = errorCode.setIntegral(packet);
-        auto errorMessage = fromStringz((cast(string)packet).ptr);
-        writeln("Error(", errorCode, "): ", errorMessage);
+    void printError() {
+        const code = getErrorCode();
+        const message = getErrorMessage();
+        writefln("Error(%s): %s", code, message);
     }
 
-    void sendPacket(in byte[] packet) {
-        const ptrdiff_t bytesSent = send(packet);
-        if (bytesSent == Socket.ERROR)
+    void sendData(in byte[] data) {
+        const ptrdiff_t len = send(data);
+        if (len == Socket.ERROR)
             throw new TFTPException("Socket error while sending data");
-        if (bytesSent != packet.length)
-            throw new TFTPException("Packet sent incomplete");
+        if (len != data.length)
+            throw new TFTPException("Data sent incomplete");
     }
 
 private:
-    ptrdiff_t receive(scope void[] buf) {
-        return sock.receiveFrom(cast(void[]) buf, addr);
+    ushort getErrorCode() {
+        ushort result;
+        mBuffer.pop(result);
+        return result;
     }
 
-    ptrdiff_t send(in byte[] buf) {
-        return sock.sendTo(cast(const void[]) buf, addr);
+    string getErrorMessage() {
+        string result;
+        mBuffer.getAll(result);
+        return result[0 .. $ - 1];
+    }
+
+    ptrdiff_t receive(scope void[] data) {
+        const len = mSocket.receiveFrom(data, mAddress);
+        return len;
+    }
+
+    ptrdiff_t send(in void[] data) {
+        const len = mSocket.sendTo(data, mAddress);
+        return len;
     }
 };
 
 class GetRequest : ClientBase {
-    private bool mHasData;
+    void delegate(Context) outputHandler;
 
     this(const string host) {
         super(host);
     }
 
-    void opCall(in string fileName) {
+    void opCall(in string filename) {
         reset();
-        sendGetRequest(fileName);
+        sendReadRequest(filename);
         try {
-            mainLoop(fileName);
+            mainLoop(filename);
         } catch (TFTPException e) {
             writeln("Error: ", e.msg);
         }
     }
 
-protected:
-    override void reset() {
-        super.reset();
-        mHasData = true;
+private:
+    struct Context {
+        string filename;
+        ushort lastBlockNumber;
+        size_t receivedDataLength;
     }
 
-private:
-    struct DataDimension {
-        size_t len;
-        string dim;
-    };
-
-    void mainLoop(in string fileName) {
-        ushort prevBlockNumber = 0;
-        size_t recvDataLen = 0;
-        while (!stopped) {
-            byte[] packet = receivePacket();
-            OpCode opCode;
-            auto buffer = Buffer(packet);
-            buffer.pop(opCode);
-            //packet = opCode.setIntegral(packet);
-            switch (opCode) {
+    void mainLoop(in string filename) {
+        Context c;
+        c.filename = filename;
+        while (!mStopped) {
+            mBuffer = receiveData();
+            switch (getOpCode()) {
             case OpCode.Data:
-                ushort blockNumber;
-                buffer.pop(blockNumber);
-                byte[] data = buffer.getRemainder();
-                //byte[] data = blockNumber.setIntegral(packet);
-                if (blockNumber == prevBlockNumber)
+                const ushort blockNumber = getBlockNumber();
+                const isDuplicatePacket = blockNumber == c.lastBlockNumber;
+                if (isDuplicatePacket)
                     continue;
-                if (blockNumber == 1)
-                    file = File(fileName, "w");
-                prevBlockNumber = blockNumber;
-                // recvDataLen += buffer.getRemainder().length;
-                recvDataLen += data.length;
-                writeDataToFile(data);
-                if (!hasData())
-                    stopped = true;
-                DataDimension dd = getRecvDataDimension(recvDataLen);
-                writef("\r%s data received is ~%s %s (%s B)",
-                        fileName, dd.len, dd.dim, recvDataLen);
+                c.lastBlockNumber = blockNumber;
+                const size_t blockSize = mBuffer.getFreeSize();
+                c.receivedDataLength += blockSize;
+                mBuffer.getAll(delegate void(in byte[] data) {
+                    if (!file.isOpen())
+                        file = File(filename, "w");
+                    file.rawWrite(data);
+                });
+                const isLastBlock = blockSize < gBlockSize;
+                if (isLastBlock)
+                    mStopped = true;
+                if (outputHandler)
+                    outputHandler(c);
                 sendBlockAck(blockNumber);
                 break;
 
             case OpCode.Error:
-                printError(packet);
+                printError();
                 return;
 
             default:
@@ -245,154 +259,130 @@ private:
             }
         }
         scope(exit) file.close();
-        scope(success) writeln();
+    }
+
+    ushort getBlockNumber() {
+        ushort result;
+        mBuffer.pop(result);
+        return result;
+    }
+
+    OpCode getOpCode() {
+        OpCode result;
+        mBuffer.pop(result);
+        return result;
     }
     
-    DataDimension getRecvDataDimension(in size_t recvDataLen) {
-        static immutable string[] dimensions = [
-            "B", "KB", "MB", "GB", "TB",
-        ];
-        DataDimension r;
-        r.len = recvDataLen;
-        r.dim = dimensions[0];
-        size_t remainder = recvDataLen;
-        for (size_t i = 1; (remainder /= 1024) != 0; ++i) {
-            r.len = remainder;
-            r.dim = dimensions[i];
-        }
-        return r;
-    }
-
-    bool hasData() const {
-        return mHasData;
-    }
-
-    void writeDataToFile(in byte[] data) {
-        if (data.length > 0) {
-            file.rawWrite(data);
-            if (data.length == gBlockSize)
-                return;
-        }
-        mHasData = false;
-    }
-
     void sendBlockAck(in ushort blockNumber) {
-        const byte[] packet = makeAckPacket(blockNumber);
-        sendPacket(packet);
+        const byte[] packet = makeBlockAck(blockNumber);
+        sendData(packet);
     }
 
-    void sendGetRequest(in string fileName) {
-        const byte[] packet = makeGetPacket(fileName);
-        sendPacket(packet);
+    void sendReadRequest(in string filename) {
+        const byte[] packet = makeReadRequest(filename);
+        sendData(packet);
     }
 
-    byte[] makeAckPacket(in ushort blockNumber) nothrow {
+    byte[] makeBlockAck(in ushort blockNumber) {
         AckPacket packet;
         packet.opCode = OpCode.Acknowledgment;
         packet.blockNumber = blockNumber;
-        return packet.serialize(buf);
+        auto serializeFunc = Serializer(buf);
+        return serializeFunc(packet);
     }
 
-    byte[] makeGetPacket(in string fileName) {
+    byte[] makeReadRequest(in string filename) {
         GetPutPacket packet;
         packet.opCode = OpCode.ReadRequest;
         packet.mode = Mode.NetAscii;
-        packet.fileName = fileName;
-        return packet.serialize(buf);
+        packet.filename = filename;
+        auto serializeFunc = Serializer(buf);
+        return serializeFunc(packet);
     }
 };
 
 
 class PutRequest : ClientBase {
     private bool mHasNext;
+    private bool mSucceeded;
 
     this(in string host) {
         super(host);
     }
 
-    void opCall(in string fileName) {
-        if (!exists(fileName)) {
-            writeln("File doesn't exist: ", fileName);
+    void opCall(in string filename) {
+        if (!exists(filename)) {
+            writeln("File doesn't exist: ", filename);
             return;
         }
-        file = File(fileName, "r");
+        file = File(filename, "r");
         scope(exit) file.close();
 
-        auto progress = Progress(file.size());
-
         reset();
-        sendPutRequest(fileName);
+
+        sendPutRequest(filename);
         try {
-            mainLoop(progress);
+            Context c;
+            c.dataSize = file.size();
+            mainLoop(c);
+            mSucceeded = true;
         } catch (TFTPException e) {
             writeln("Error: ", e.msg);
         }
     }
 
+    bool isSucceeded() const {
+        return mSucceeded;
+    }
+
+    struct Context {
+        ushort currentBlockNumber;
+        size_t dataSize;
+    }
+
+    void delegate(Context) outputHandler;
+
 protected:
     override void reset() {
         super.reset();
         mHasNext = true;
+        mSucceeded = false;
+        mBuffer = buf;
     }
 
 private:
-    struct Progress {
-        immutable size_t lineLen = 20;
-        private float mFactor;
-
-        this(in size_t size) {
-            mFactor = calcBlockFactor(size);
-        }
-
-        void setTo(scope char[] line, in size_t blockNumber) const {
-            const size_t end = cast(size_t)(blockNumber * mFactor);
-            if (end == 0)
-                return;
-            line[0 .. end - 1] = '=';
-            line[end - 1] = '>';
-        }
-
-    private:
-        float calcBlockFactor(size_t size) {
-            const size_t remainder = (size % gBlockSize) != 0;
-            const size_t fileBlocks = size / gBlockSize + remainder;
-            return float(lineLen) / float(fileBlocks);
-        }
+    OpCode getOpCode() {
+        OpCode result;
+        mBuffer.pop(result);
+        return result;
     }
 
-    void mainLoop(in Progress progress) {
-        string progressLineTemplate = "\r[%s]";
-        char[Progress.lineLen] progressLine = '-';
-        ushort currentBlockNumber = 0;
+    ushort getBlockNumber() {
+        ushort result;
+        mBuffer.pop(result);
+        return result;
+    }
 
-        while (!stopped) {
-            byte[] answer = receivePacket();
-            OpCode opCode;
-            auto buffer = Buffer(answer);
-            buffer.pop(opCode);
-            byte[] remain = buffer.getRemainder();
-            //byte[] remain = opCode.setIntegral(answer);
-
-            switch (opCode) {
+    void mainLoop(scope ref Context c) {
+        while (!mStopped) {
+            mBuffer = receiveData();
+            switch (getOpCode()) {
             case OpCode.Acknowledgment:
-                ushort blockNumber;
-                buffer.pop(blockNumber);
-                //blockNumber.setIntegral(remain);
-                if (blockNumber != currentBlockNumber)
+                const blockNumber = getBlockNumber();
+                const isExpiredPacket = blockNumber != c.currentBlockNumber;
+                if (isExpiredPacket)
                     continue;
 
-                progress.setTo(progressLine, currentBlockNumber);
-                writef(progressLineTemplate, progressLine);
-                fflush(stdout);
+                if (outputHandler)
+                    outputHandler(c);
 
-                ++currentBlockNumber;
-                sendNextBlock(currentBlockNumber);
+                sendNextBlock(c.currentBlockNumber);
                 if (!hasNext())
-                    stopped = true;
+                    mStopped = true;
                 break;
 
             case OpCode.Error:
-                printError(remain);
+                printError();
                 return;
 
             default:
@@ -400,8 +390,8 @@ private:
             }
         }
         scope(success) {
-            progressLine = '=';
-            writefln(progressLineTemplate, progressLine);
+            //progressLine = '=';
+            //writefln(progressLineTemplate, progressLine);
         }
     }
 
@@ -409,37 +399,41 @@ private:
         return mHasNext;
     }
 
-    void sendNextBlock(in ushort blockNumber) {
-        const byte[] packet = makeDataPacket(blockNumber);
-        sendPacket(packet);
+    void sendNextBlock(scope ref ushort blockNumber) {
+        ++blockNumber;
+        const request = makeDataRequest(blockNumber);
+        sendData(request);
         const size_t expectedSize = ODataPacket.opCode.sizeof
                 + ODataPacket.blockNumber.sizeof
                 + gBlockSize;
-        mHasNext = packet.length == expectedSize;
+        mHasNext = request.length == expectedSize;
     }
 
-    void sendPutRequest(in string fileName) {
-        const byte[] packet = makePutPacket(fileName);
-        sendPacket(packet);
+    void sendPutRequest(in string filename) {
+        const byte[] request = makePutRequest(filename);
+        sendData(request);
     }
 
-    byte[] makeDataPacket(in ushort blockNumber) {
+    byte[] makeDataRequest(in ushort blockNumber) {
         ODataPacket packet;
         packet.opCode = OpCode.Data;
         packet.blockNumber = blockNumber;
-        packet.blocksSource = makeFileReaderFunc();
-        return packet.serialize(buf);
+        packet.blocksSource = makeFileReadFunc();
+        auto serialize = Serializer(buf);
+        return serialize(packet);
     }
 
-    byte[] makePutPacket(in string fileName) {
+    byte[] makePutRequest(in string filename) {
         GetPutPacket packet;
         packet.opCode = OpCode.WriteRequest;
         packet.mode = Mode.NetAscii;
-        packet.fileName = fileName;
-        return packet.serialize(buf);
+        packet.filename = filename;
+        auto serialize = Serializer(buf);
+        auto result = serialize(packet);
+        return result;
     }
 
-    BlockReader makeFileReaderFunc() nothrow {
+    ReadFunc makeFileReadFunc() nothrow {
         return delegate size_t(scope byte[] buf) {
             const byte[] res = file.rawRead(buf);
             return res.length;
@@ -447,59 +441,125 @@ private:
     }
 };
 
+struct Progress {
+    private float mFactor;
+    private char[] mLineBuffer;
 
-union ByteRepr(T) {
-    T value;
-    void[T.sizeof] bytes;
-};
+    this(scope char[] lineBuffer, size_t dataSize) {
+        mLineBuffer = lineBuffer;
+        mLineBuffer[0 .. $] = '-';
+        mFactor = calcBlockFactor(dataSize);
+    }
+
+    bool isValid() const {
+        return mFactor > 0.0f;
+    }
+
+    void update(size_t blockNumber) {
+        const end = cast(size_t)(blockNumber * mFactor);
+        if (end == 0)
+            return;
+        mLineBuffer[0 .. end - 1] = '=';
+        mLineBuffer[end - 1] = '>';
+    }
+
+    void fill() {
+        mLineBuffer[0 .. $] = '=';
+    }
+
+private:
+    float calcBlockFactor(size_t dataSize) {
+        const size_t remainder = (dataSize % gBlockSize) != 0;
+        const size_t fileBlocks = dataSize / gBlockSize + remainder;
+        return float(mLineBuffer.length) / float(fileBlocks);
+    }
+}
+
 
 struct Buffer
 {
-    // this(size_t bufferSize) {
-    //     mBuffer = new byte[bufferSize];
-    // }
-
-    this(byte[] outerBuffer) nothrow {
+    this(scope byte[] outerBuffer) nothrow {
         mBuffer = outerBuffer;
         mFree = mBuffer;
+    }
+
+    byte[] getUsed() {
+        const len = mBuffer.length - mFree.length;
+        return mBuffer[0 .. len];
     }
 
     byte[] getRemainder() nothrow {
         return mFree;
     }
 
-    void push(T)(in T integer) nothrow {
-        ByteRepr!T temp;
-        temp.value = toNetworkByteOrder(integer);
-        auto buf = getFreeAndCut(T.sizeof);
-        buf[0 .. temp.bytes.length] = cast(byte[])temp.bytes;
+    size_t getFreeSize() const nothrow {
+        return mFree.length;
     }
 
-    void push(in ubyte value) nothrow {
+    void push(in ubyte value) {
         auto buf = getFreeAndCut(ubyte.sizeof);
         buf[0] = cast(byte)value;
     }
 
-    void pop(T)(ref T integer) nothrow {
+    void push(in string value) {
+        if (value.length <= 0)
+            return;
+        static assert('\0'.sizeof == 1);
+        auto buf = getFreeAndCut(value.length + '\0'.sizeof);
+        buf[0 .. value.length] = cast(byte[])value;
+        buf[value.length] = '\0';
+    }
+
+    void push(T)(in T integer) {
+        ByteRepr!T temp;
+        temp.value = cast(T)toNetworkByteOrder(integer);
+        auto buf = getFreeAndCut(T.sizeof);
+        buf[0 .. temp.bytes.length] = cast(byte[])temp.bytes;
+    }
+
+    void pushBlock(ReadFunc readFunc) {
+        auto buf = getFree(gBlockSize);
+        const size_t len = readFunc(buf);
+        cut(len);
+    }
+
+    void pop(T)(scope ref T integer) {
         ByteRepr!T temp;
         temp.bytes = getFreeAndCut(T.sizeof);
         integer = cast(T)toNetworkByteOrder(temp.value);
     }
 
-    size_t popBlock(size_t delegate(byte[]) writeFunc) {
-        auto buf = getFreeAndCut(gBlockSize);
-        return writeFunc(buf);
+    void getAll(scope ref string value) {
+        value = cast(string)mFree;
     }
 
-    void opAssign(byte[] rhs) {
+    void getAll(void delegate(in byte[]) readFrom) {
+        readFrom(mFree);
+    }
+
+    void opAssign(scope byte[] rhs) {
         mFree = rhs;
     }
 
 protected:
-    byte[] getFreeAndCut(size_t length) nothrow {
-        auto result = mFree[0 .. length];
-        mFree = mFree[length .. $];
+    union ByteRepr(T) {
+        T value;
+        void[T.sizeof] bytes;
+    };
+
+    byte[] getFreeAndCut(size_t length) {
+        auto result = getFree(length);
+        cut(length);
         return result;
+    }
+
+    byte[] getFree(size_t length) {
+        return mFree[0 .. length];
+    }
+
+    @safe
+    void cut(size_t length) {
+        mFree = mFree[length .. $];
     }
 
 private:
@@ -507,44 +567,50 @@ private:
     byte[] mFree;
 }
 
-// static byte[] setIntegral(T)(return scope byte[] buf, in T value) nothrow {
-//     ByteRepr!T temp;
-
-//     temp.value = toNetworkByteOrder(value);
-//     buf = cast(byte[]) temp.bytes;
-//     return buf[T.sizeof .. $];
-// }
-
-// static byte[] setIntegral(T)(ref T value, return byte[] buf) nothrow {
-//     ByteRepr!T temp;
-//     temp.bytes = buf;
-//     value = cast(T) toNetworkByteOrder(temp.value);
-//     return buf[T.sizeof .. $];
-// }
-
 enum ExitCode {
-    Success,
-    InvalidArgumentsNumber,
-    UnknownCommand,
+    success,
+    invalidArgumentsNumber,
+    unknownCommand,
 };
 
 int main(string[] args) {
     if (args.length < 4) {
         writefln("\"host\" \"put|get\" \"file name\"");
-        return ExitCode.InvalidArgumentsNumber;
+        return ExitCode.invalidArgumentsNumber;
     }
     const string host     = args[1];
     const string command  = args[2];
-    const string fileName = args[3];
+    const string filename = args[3];
     if (command == "get") {
         auto get = new GetRequest(host);
-        get(fileName);
+        get.outputHandler = delegate void(GetRequest.Context c) {
+            const dataDim = sizeToDataDimension(c.receivedDataLength);
+            writef("\r%s data received is ~%s %s (%s B)",
+                    c.filename, dataDim.len, dataDim.dim, c.receivedDataLength);
+        };
+        get(filename);
+        writeln();
     } else if (command == "put") {
         auto put = new PutRequest(host);
-        put(fileName);
+
+        char[50] progressLine;
+        Progress progress;
+
+        put.outputHandler = delegate void(PutRequest.Context c) {
+            if (!progress.isValid())
+                progress = Progress(progressLine, c.dataSize);
+            progress.update(c.currentBlockNumber);
+            writef("\r[%s]", progressLine);
+            fflush(stdout);
+        };
+        put(filename);
+        if (put.isSucceeded()) {
+            progress.fill();
+            writef("\r[%s]", progressLine);
+        }
     } else {
         writeln("Unknown command: ", command);
-        return ExitCode.UnknownCommand;
+        return ExitCode.unknownCommand;
     }
-    return ExitCode.Success;
+    return ExitCode.success;
 }
