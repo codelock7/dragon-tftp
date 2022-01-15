@@ -1,0 +1,9 @@
+{
+	"authors": [
+		"codelock"
+	],
+	"copyright": "Copyright © 2022, codelock",
+	"description": "A minimal D application.",
+	"license": "gpl-3.0",
+	"name": "dragon-tftp"
+}
